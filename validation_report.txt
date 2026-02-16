@@ -1,0 +1,39 @@
+============================================================
+📊 0DTE COMMANDER DATA VALIDATION REPORT
+============================================================
+Symbol: SPY
+Timestamp: 2026-02-14T11:14:56.575028
+
+📈 SUMMARY:
+   Total Checks: 9
+   Passed: 7
+   Failed: 2
+   Success Rate: 77.8%
+
+🔍 DETAILED RESULTS:
+------------------------------------------------------------
+⚠️ DATA_COMPLETENESS: WARNING
+   • small_dataset: Only 93 rows available
+   • total_rows: 93
+   • total_columns: 19
+❌ NAN_PROPAGATION: FAIL
+   • nan_columns: {'slow_line': 16, 'drift_spread': 16, 'drift_velocity': 18, 'velocity': 2, 'volatility': 6, 'adx': 19}
+   • excessive_nan: {'adx': 19}
+✅ TIMEZONE_ALIGNMENT: PASS
+✅ VECTORIZED_CALCULATIONS: PASS
+   • ema_accuracy: Max difference: 0.00e+00
+⏭️ VWAP_SESSION_RESET: SKIP
+   • Need multi-day data to validate session resets
+✅ ADX_CHOP_FILTER: PASS
+   • peg_signals_checked: 17
+   • min_adx_on_peg: 31.461669030002266
+✅ REGIME_DISTRIBUTION: PASS
+   • regime_distribution: {'neutral': 42, 'bear_peg': 17, 'band_touch': 11, 'launch': 8, 'bear_divergence': 7, 'squeeze': 5, 'bull_divergence': 2, 'bear_snapback': 1}
+✅ DATA_CONTINUITY: PASS
+✅ CALCULATION_ACCURACY: PASS
+✅ PERFORMANCE_BENCHMARKS: PASS
+   • vectorized_time_ms: 0.21
+   • data_points: 93
+   • throughput: 433894 points/sec
+
+============================================================
