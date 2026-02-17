@@ -187,7 +187,7 @@ def print_backtest_results(metrics: dict, trades: list, df: pd.DataFrame):
     print("="*80)
 
     if 'error' in metrics:
-        print(f"❌ No trades executed: {metrics['error']}")
+        print("[NO TRADES] No trades executed: {}".format(metrics['error']))
         print("\nPossible reasons:")
         print("- No signals generated (check regime conditions)")
         print("- Data doesn't meet signal criteria")

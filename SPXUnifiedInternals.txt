@@ -1,0 +1,439 @@
+# =========================================================
+# Unified Internals Dashboard v5.0 (Elite Edition)
+# 0DTE Commander System | Tuned for 5-Minute /ES Charts
+#
+# Updates from v4.4 → v5.0:
+# TIER 1 ENHANCEMENTS (4 Critical Features):
+# 1. MAG7 Market-Cap Weighting (accurate index impact)
+# 2. Vol Flow Persistence Tracking (institutional vs noise)
+# 3. Price-Volume Divergence Detection (reversal signals)
+# 4. Regime Classifier (Risk-On/Risk-Off environment)
+# =========================================================
+
+declare lower;
+
+# === INPUTS: CONFIGURATION ===
+input showLabels = yes;
+input showMag7 = yes;        
+input showRiskCalc = yes;    
+
+# === INPUTS: SENSITIVITY ===
+input adxThreshold = 20;
+input tickShockLevel = -800;
+input trinPanicLevel = 2.0;
+input trinGreedLevel = 0.6;
+
+# === INPUTS: SCALING ===
+input tickNormalizationMode = {default Fixed_Scale, Session_HighLow, Auto_Scale};
+input mag7ScaleMult = 3000;       
+input mag7ClampThreshold = 100;   
+input mag7ClampFactor = 0.10;     
+
+# =====================================
+# === GLOBAL DATA CHECK
+# =====================================
+def isValidBar = !IsNaN(close);
+
+# =====================================
+# === DATA FETCHING
+# =====================================
+def upVol = close("$UVOLSP");
+def downVol = close("$DVOLSP");
+def upIssues = close("$ADVSP");
+def downIssues = close("$DECLSP");
+def tickData = close("$TIKSP");
+def adspData = close("$ADSPD");
+def vixData = close("VIX");
+def trinData = close("$TRINSP");
+
+# --- Mag 7 Data ---
+def m1 = close("NVDA"); def m2 = close("AAPL"); def m3 = close("MSFT");
+def m4 = close("AMZN"); def m5 = close("GOOGL"); def m6 = close("META");
+def m7 = close("TSLA");
+
+# =====================================
+# === ENGINE 1: BREADTH & TRIN
+# =====================================
+
+# Breadth
+def totalVol = upVol + downVol;
+def VolBreadthPercent = if totalVol != 0 then 100 * (upVol - downVol) / totalVol else 0;
+def TickBreadthPercent = 100 * (adspData / 500);
+
+# TRIN (The Fear Gauge)
+def TRIN_Raw = if !IsNaN(trinData) then trinData else 1.0;
+def TRIN = ExpAverage(TRIN_Raw, 2);
+
+# TRIN States
+def isTrinPanic = TRIN > trinPanicLevel;
+def isTrinGreed = TRIN < trinGreedLevel;
+def isTrinDivergence = 
+    (VolBreadthPercent > 20 and TRIN > 1.2) or
+    (VolBreadthPercent < -20 and TRIN < 0.8);
+
+# =====================================
+# === ENGINE 2: TICK VELOCITY
+# =====================================
+def tick_raw = if IsNaN(tickData) then 0 else tickData;
+def tick_val = if tick_raw == 0 then tick_raw[1] else tick_raw;
+def tickVelocity = tick_val - tick_val[1];
+
+# Tick States
+def isTickShock = tick_val < tickShockLevel or tickVelocity < -200;
+def isTickSurge = tick_val > -tickShockLevel or tickVelocity > 200;
+
+# Session-based rolling max
+rec rollingMaxTick_Session = 
+    if SecondsFromTime(0930) == 0 then AbsValue(tick_val) 
+    else Max(rollingMaxTick_Session[1], AbsValue(tick_val));
+def rollingMaxTick = Max(0.00001, rollingMaxTick_Session);
+
+def rawTickPulse = tick_val / rollingMaxTick;
+def TickPulsePercent = ExpAverage(rawTickPulse * 100, 2);
+
+# =====================================
+# === ENGINE 3: MAG 7 COMMANDER (V5.0 ENHANCED - FIXED)
+# =====================================
+
+# Calculate individual changes
+def chg1 = if !IsNaN(m1) and !IsNaN(m1[1]) and m1[1]>0 then (m1-m1[1])/m1[1] else Double.NaN;
+def chg2 = if !IsNaN(m2) and !IsNaN(m2[1]) and m2[1]>0 then (m2-m2[1])/m2[1] else Double.NaN;
+def chg3 = if !IsNaN(m3) and !IsNaN(m3[1]) and m3[1]>0 then (m3-m3[1])/m3[1] else Double.NaN;
+def chg4 = if !IsNaN(m4) and !IsNaN(m4[1]) and m4[1]>0 then (m4-m4[1])/m4[1] else Double.NaN;
+def chg5 = if !IsNaN(m5) and !IsNaN(m5[1]) and m5[1]>0 then (m5-m5[1])/m5[1] else Double.NaN;
+def chg6 = if !IsNaN(m6) and !IsNaN(m6[1]) and m6[1]>0 then (m6-m6[1])/m6[1] else Double.NaN;
+def chg7 = if !IsNaN(m7) and !IsNaN(m7[1]) and m7[1]>0 then (m7-m7[1])/m7[1] else Double.NaN;
+
+# *** FIXED: Market-Cap Weighted Scoring ***
+# Weights scaled to sum = 7.0 (maintains V4.4 visual scale)
+# Distribution based on market cap % of MAG7 total (~$16.1T)
+def weight_NVDA = 1.30;  # 18.6% ($3.0T)
+def weight_AAPL = 1.52;  # 21.7% ($3.5T)
+def weight_MSFT = 1.39;  # 19.9% ($3.2T)
+def weight_AMZN = 0.87;  # 12.4% ($2.0T)
+def weight_GOOGL = 0.91; # 13.0% ($2.1T)
+def weight_META = 0.61;  #  8.7% ($1.4T)
+def weight_TSLA = 0.39;  #  5.6% ($0.9T)
+
+# CRITICAL FIX: Parentheses wrap entire sum before multiplying by mag7ScaleMult
+def mag7_raw_score = 
+    ((if !IsNaN(chg1) then chg1 * weight_NVDA else 0) +
+     (if !IsNaN(chg2) then chg2 * weight_AAPL else 0) +
+     (if !IsNaN(chg3) then chg3 * weight_MSFT else 0) +
+     (if !IsNaN(chg4) then chg4 * weight_AMZN else 0) +
+     (if !IsNaN(chg5) then chg5 * weight_GOOGL else 0) +
+     (if !IsNaN(chg6) then chg6 * weight_META else 0) +
+     (if !IsNaN(chg7) then chg7 * weight_TSLA else 0)) * mag7ScaleMult;
+
+def mag7_true = ExpAverage(mag7_raw_score, 4);
+
+# Mag 7 States
+def mag7Bull = mag7_true > 10;
+def mag7Bear = mag7_true < -10;
+def isNarrowRally = mag7Bull and VolBreadthPercent < -10; 
+def isRotationalWeakness = mag7Bear and VolBreadthPercent > 10; 
+
+# Display Clamp
+def mag7_display =
+    if mag7_true > mag7ClampThreshold then mag7ClampThreshold + (mag7_true - mag7ClampThreshold) * mag7ClampFactor
+    else if mag7_true < -mag7ClampThreshold then -mag7ClampThreshold + (mag7_true + mag7ClampThreshold) * mag7ClampFactor
+    else mag7_true;
+
+# =====================================
+# === ENGINE 4: TACTICAL VETO
+# =====================================
+def isVetoState = isNarrowRally or isRotationalWeakness or isTrinDivergence;
+
+# =====================================
+# === PLOTTING
+# =====================================
+
+plot Mag7Line = if isValidBar and showMag7 then mag7_display else Double.NaN;
+Mag7Line.SetDefaultColor(Color.VIOLET);
+Mag7Line.SetLineWeight(2);
+Mag7Line.SetStyle(Curve.FIRM);
+
+plot TICK_Line = if isValidBar then TickPulsePercent else Double.NaN;
+TICK_Line.SetLineWeight(1);
+TICK_Line.AssignValueColor(
+    if isTickSurge then Color.CYAN
+    else if isTickShock then Color.MAGENTA
+    else Color.GRAY
+);
+
+plot AD_Line = if isValidBar then TickBreadthPercent else Double.NaN;
+AD_Line.SetDefaultColor(Color.WHITE);
+AD_Line.SetLineWeight(1);
+AD_Line.SetStyle(Curve.LONG_DASH);
+
+plot VolHisto = if isValidBar then VolBreadthPercent else Double.NaN;
+VolHisto.SetPaintingStrategy(PaintingStrategy.HISTOGRAM);
+VolHisto.SetLineWeight(3);
+VolHisto.AssignValueColor(
+    if VolHisto >= 0 then if VolHisto > VolHisto[1] then Color.GREEN else Color.DARK_GREEN
+    else if VolHisto < VolHisto[1] then Color.RED else Color.DARK_RED
+);
+
+plot ZeroLine = if isValidBar then 0 else Double.NaN;
+ZeroLine.SetLineWeight(2);
+def adx = ADX(length = 14);
+ZeroLine.AssignValueColor(if adx > 20 then Color.YELLOW else Color.DARK_GRAY);
+
+AssignBackgroundColor(
+    if !isValidBar then Color.CURRENT
+    else if adx > 35 then CreateColor(0, 30, 0)
+    else if adx > 20 then CreateColor(0, 0, 0)
+    else CreateColor(20, 20, 20)
+);
+
+# =====================================
+# === TACTICAL DASHBOARD
+# =====================================
+
+# 1. THE VETO LABEL
+AddLabel(showLabels and isValidBar and isVetoState,
+    "⚠️ INTERNAL VETO: " + (
+        if isNarrowRally then "NARROW RALLY (Generals Only)"
+        else if isRotationalWeakness then "ROTATIONAL WEAKNESS"
+        else "TRIN DIVERGENCE"
+    ),
+    Color.MAGENTA
+);
+
+# 2. MAG 7 STATUS
+AddLabel(showLabels and isValidBar and !isVetoState,
+    "MAG7: " + (
+        if mag7Bull then "BULLISH (" + Round(mag7_true,0) + ")"
+        else if mag7Bear then "BEARISH (" + Round(mag7_true,0) + ")"
+        else "NEUTRAL"
+    ),
+    if mag7Bull then Color.VIOLET else if mag7Bear then Color.PLUM else Color.GRAY
+);
+
+# 3. TRIN STATUS (Panic Detector)
+AddLabel(showLabels and isValidBar,
+    "TRIN: " + Round(TRIN, 2) + (
+        if isTrinPanic then " [PANIC - REVERSION OPP]"
+        else if isTrinGreed then " [EUPHORIA - CAUTION]"
+        else ""
+    ),
+    if isTrinPanic then Color.CYAN
+    else if isTrinGreed then Color.ORANGE
+    else Color.GRAY
+);
+
+# 4. TICK STATUS (Level + Velocity)
+AddLabel(showLabels and isValidBar,
+    "TICK: " + Round(tick_val, 0) + " (Vel: " + Round(tickVelocity,0) + ")",
+    if isTickShock then Color.MAGENTA else if isTickSurge then Color.CYAN else Color.GRAY
+);
+
+# =====================================
+# === ENGINE 6: ADAPTIVE VOLUME FLOW (V5.0 ENHANCED)
+# =====================================
+
+# 1. Calculate Raw Velocities
+def uvolRaw = if !IsNaN(upVol) then upVol else 0;
+def dvolRaw = if !IsNaN(downVol) then downVol else 0;
+
+def uVel = uvolRaw - uvolRaw[1];
+def dVel = dvolRaw - dvolRaw[1];
+
+# 2. Adaptive Thresholds
+def uVelStd = StDev(uVel, 20);
+def dVelStd = StDev(dVel, 20);
+
+def uSurge = uVel > (uVelStd * 1.5);
+def dSurge = dVel > (dVelStd * 1.5);
+def uDrop = uVel < -(uVelStd * 1.5);
+def dDrop = dVel < -(dVelStd * 1.5);
+
+# 3. Time Filter
+def isRTH = SecondsFromTime(0930) >= 0 and SecondsTillTime(1600) > 0;
+
+# 4. Logic States
+def isAggressiveBuy = isRTH and uSurge;
+def isSellerExhaustion = isRTH and dDrop and !uSurge;
+def isAggressiveSell = isRTH and dSurge;
+def isBuyerExhaustion = isRTH and uDrop and !dSurge;
+
+# *** NEW: PERSISTENCE TRACKING ***
+# Track consecutive bars of sustained flow
+rec AggressiveBuy_Streak = 
+    if !isRTH then 0
+    else if isAggressiveBuy then AggressiveBuy_Streak[1] + 1
+    else 0;
+
+rec AggressiveSell_Streak = 
+    if !isRTH then 0
+    else if isAggressiveSell then AggressiveSell_Streak[1] + 1
+    else 0;
+
+# Sustained = 3+ bars (15+ minutes on 5-min chart)
+def isSustainedBuy = AggressiveBuy_Streak >= 3;
+def isSustainedSell = AggressiveSell_Streak >= 3;
+
+# *** NEW: PRICE-VOLUME DIVERGENCE ***
+# Detect absorption/distribution patterns
+def priceChange = close - close[1];
+def isPriceUp = priceChange > 0;
+def isPriceDown = priceChange < 0;
+
+# Absorption: Price falling but sellers exhausted (bullish reversal)
+def isBullishAbsorption = isPriceDown and isSellerExhaustion;
+
+# Distribution: Price rising but buyers exhausted (bearish reversal)
+def isBearishDistribution = isPriceUp and isBuyerExhaustion;
+
+# 5. Flow Quality Score
+def flowQualityScore = 
+    if isAggressiveBuy then 1
+    else if isAggressiveSell then -1
+    else 0;
+
+# =====================================
+# === FLOW CONTEXT LABEL (ENHANCED)
+# =====================================
+AddLabel(showLabels and isValidBar, 
+    # Priority 1: Divergence signals (highest conviction)
+    if isBullishAbsorption then "🎯 FLOW: ABSORPTION (BUYERS STEPPING IN)"
+    else if isBearishDistribution then "🎯 FLOW: DISTRIBUTION (SELLERS STEPPING IN)"
+    
+    # Priority 2: Sustained institutional flow
+    else if isSustainedBuy then "FLOW: SUSTAINED BID (" + AggressiveBuy_Streak + " bars)"
+    else if isSustainedSell then "FLOW: SUSTAINED OFFER (" + AggressiveSell_Streak + " bars)"
+    
+    # Priority 3: Single-bar signals
+    else if isAggressiveBuy then "FLOW: AGGRESSIVE BID (Demand)"
+    else if isSellerExhaustion then "FLOW: SELLER EXHAUSTION (Vacuum)"
+    else if isAggressiveSell then "FLOW: AGGRESSIVE OFFER (Supply)"
+    else if isBuyerExhaustion then "FLOW: BUYER EXHAUSTION (Vacuum)"
+    else "FLOW: STABLE",
+    
+    # Color coding
+    if isBullishAbsorption then Color.GREEN
+    else if isBearishDistribution then Color.RED
+    else if isSustainedBuy then Color.CYAN
+    else if isSustainedSell then Color.MAGENTA
+    else if isAggressiveBuy then Color.LIGHT_GREEN
+    else if isSellerExhaustion then Color.DARK_GREEN
+    else if isAggressiveSell then Color.LIGHT_RED
+    else if isBuyerExhaustion then Color.DARK_RED
+    else Color.GRAY
+);
+
+# =====================================
+# === ENGINE 5: HEALTH SCORE AGGREGATE
+# =====================================
+
+# 1. Core Trend Drivers
+def scoreBreadth = 
+    if VolBreadthPercent > 30 then 2
+    else if VolBreadthPercent > 15 then 1
+    else if VolBreadthPercent < -30 then -2
+    else if VolBreadthPercent < -15 then -1
+    else 0;
+
+def scoreMag7 = 
+    if mag7_true > 20 then 2
+    else if mag7_true > 10 then 1
+    else if mag7_true < -20 then -2
+    else if mag7_true < -10 then -1
+    else 0;
+
+# 2. Momentum Modifiers
+def scoreTick = 
+    if tick_val > 0 and isTickSurge then 1
+    else if tick_val < 0 and isTickShock then -1
+    else 0;
+
+def scoreTrin = 
+    if TRIN > 0.6 and TRIN < 0.9 then 1
+    else if TRIN > 1.1 and TRIN < 1.8 then -1
+    else 0;
+
+# 3. Aggregate Score
+def healthScore = scoreBreadth + scoreMag7 + scoreTick + scoreTrin;
+
+# 4. Health Label
+AddLabel(showLabels and isValidBar and !isVetoState,
+    "HEALTH: " + (
+        if healthScore >= 5 then "V.STRONG BULL (" + healthScore + ")"
+        else if healthScore >= 3 then "STRONG BULL (" + healthScore + ")"
+        else if healthScore >= 1 then "BULL LEAN (" + healthScore + ")"
+        else if healthScore <= -5 then "V.STRONG BEAR (" + healthScore + ")"
+        else if healthScore <= -3 then "STRONG BEAR (" + healthScore + ")"
+        else if healthScore <= -1 then "BEAR LEAN (" + healthScore + ")"
+        else "MIXED/CHOP (" + healthScore + ")"
+    ),
+    if healthScore >= 5 then Color.GREEN
+    else if healthScore >= 3 then Color.LIGHT_GREEN
+    else if healthScore >= 1 then Color.DARK_GREEN
+    else if healthScore <= -5 then Color.RED
+    else if healthScore <= -3 then Color.LIGHT_RED
+    else if healthScore <= -1 then Color.DARK_RED
+    else Color.GRAY
+);
+
+# =====================================
+# === ENGINE 7: REGIME CLASSIFIER (V5.0 NEW)
+# =====================================
+
+# Build regime score from multiple factors
+# VIX Component: Calm vs Panic
+def VIX_Safe = if !IsNaN(vixData) then vixData else 20;
+def regimeVIX = 
+    if VIX_Safe < 15 then -2      # Very calm (Risk-On)
+    else if VIX_Safe < 20 then -1 # Calm
+    else if VIX_Safe > 25 then 2  # Panic (Risk-Off)
+    else if VIX_Safe > 20 then 1  # Elevated
+    else 0;
+
+# TRIN Component: Greed vs Fear
+def regimeTRIN = 
+    if TRIN < 0.7 then -2         # Extreme greed (Risk-On)
+    else if TRIN < 0.9 then -1    # Greed
+    else if TRIN > 1.8 then 2     # Panic (Risk-Off)
+    else if TRIN > 1.3 then 1     # Fear
+    else 0;
+
+# Internals Component: Strong vs Weak
+def regimeInternals = 
+    if healthScore >= 4 then -2   # Very strong (Risk-On)
+    else if healthScore >= 2 then -1
+    else if healthScore <= -4 then 2  # Very weak (Risk-Off)
+    else if healthScore <= -2 then 1
+    else 0;
+
+# Aggregate Regime Score
+def Regime_Score = regimeVIX + regimeTRIN + regimeInternals;
+
+# Classify Regime
+def Market_Regime = 
+    if Regime_Score >= 3 then 2      # RISK OFF
+    else if Regime_Score <= -3 then -2 # RISK ON
+    else 0;                            # TRANSITIONAL
+
+# Regime Label
+AddLabel(showLabels and isValidBar,
+    "REGIME: " + (
+        if Market_Regime == 2 then "RISK-OFF (" + Regime_Score + ") - REDUCE SIZE"
+        else if Market_Regime == -2 then "RISK-ON (" + Regime_Score + ") - FULL SIZE"
+        else "TRANSITIONAL (" + Regime_Score + ") - NORMAL SIZE"
+    ),
+    if Market_Regime == 2 then Color.RED
+    else if Market_Regime == -2 then Color.GREEN
+    else Color.YELLOW
+);
+
+# =====================================
+# === RISK ENGINE
+# =====================================
+def atr = ATR(14);
+def stopDistance = atr * 2.0;
+def calcPosSize = if stopDistance > 0 then 500 / (stopDistance * 50) else 0;
+
+AddLabel(showLabels and showRiskCalc and isValidBar,
+    "RISK: $500 | Stop: " + Round(stopDistance, 2) + "pts | Size: " + Round(calcPosSize, 1) + "x",
+    Color.ORANGE
+);

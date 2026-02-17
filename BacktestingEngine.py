@@ -775,6 +775,10 @@ class CommanderStrategy:
         except Exception:
             df['vix_crush'] = False
 
+        # 6) Internals Veto (Unified Internals)
+        # Ensure we respect the internals veto if calculated
+        has_internals_veto = 'veto_internals' in df.columns
+
         # Apply veto rules
         initial_signals = df['entry_signal'].copy()
 
@@ -786,6 +790,10 @@ class CommanderStrategy:
 
         # Skip all if VIX crushed
         df.loc[df['vix_crush'] == True, ['entry_signal','signal_type']] = (0, None)
+        
+        # Skip all if Internals Veto is active
+        if has_internals_veto:
+            df.loc[df['veto_internals'] == True, ['entry_signal','signal_type']] = (0, None)
 
         # VIX regime enforcement
         # Launch -> only high
@@ -796,11 +804,41 @@ class CommanderStrategy:
         df.loc[(df['signal_type'] == 'sniper_buy') & (df['vix_regime'] == 'low'), ['entry_signal','signal_type']] = (0, None)
 
         # ADX divergence: skip Launch and Bull PEG when ADX falling or below cutoff
-        df.loc[((df['adx_falling'] == True) | (df['adx_below_cutoff'] == True)) & (df['signal_type'].isin(['launch','bull_peg'])), ['entry_signal','signal_type']] = (0, None)
+        # Only veto falling ADX if the trend is already weak (< 25)
+        df.loc[((df['adx_falling'] == True) & (df['adx'] < 25) | (df['adx_below_cutoff'] == True)) & (df['signal_type'].isin(['launch','bull_peg'])), ['entry_signal','signal_type']] = (0, None)
 
         # Log veto counts
         vetoed = (initial_signals.abs() - df['entry_signal'].abs()).sum()
-        logger.info(f"Veto layer applied. Signals vetoed: {int(vetoed)}")
+        
+        # Detailed Veto Breakdown
+        if vetoed > 0:
+            logger.info(f"Veto layer applied. Total signals vetoed: {int(vetoed)}")
+            
+            # Calculate which specific conditions were active during valid signals
+            signal_mask = initial_signals != 0
+            
+            veto_stats = {
+                'Volume Climax': (signal_mask & df['volume_climax']).sum(),
+                'Time of Day (Avoid)': (signal_mask & df['avoid_tod']).sum(),
+                'VIX Crush': (signal_mask & df['vix_crush']).sum(),
+                'ADX Falling': (signal_mask & df['adx_falling']).sum(),
+                'ADX Low (<Cutoff)': (signal_mask & df['adx_below_cutoff']).sum()
+            }
+            if has_internals_veto:
+                veto_stats['Internals Health'] = (signal_mask & df['veto_internals']).sum()
+                # Breakdown of internals vetoes
+                if 'veto_uvol_dvol' in df.columns:
+                    veto_stats['  - UVOL/DVOL'] = (signal_mask & df['veto_uvol_dvol']).sum()
+                if 'veto_trin_extreme' in df.columns:
+                    veto_stats['  - TRIN'] = (signal_mask & df['veto_trin_extreme']).sum()
+                if 'veto_tick_extreme' in df.columns:
+                    veto_stats['  - TICK'] = (signal_mask & df['veto_tick_extreme']).sum()
+                if 'veto_mag7_concentration' in df.columns:
+                    veto_stats['  - Mag7'] = (signal_mask & df['veto_mag7_concentration']).sum()
+                
+            for reason, count in veto_stats.items():
+                if count > 0:
+                    logger.info(f"  - {reason}: blocked {count} signals")
 
         # Clean temporary columns used for veto logic
         temp_cols = ['mvv_threshold','vol_ma20','volume_spike','volume_climax','et_hour','et_min',
@@ -910,20 +948,32 @@ class CommanderStrategy:
                 holding_period = (current_time - position['entry_time']).total_seconds() / 60
                 exit_reason = None
 
+                # Physics-based exits (Priority)
+                if not exit_reason and row.get('is_theta_burn', False):
+                    exit_reason = 'theta_burn'
+                
+                if not exit_reason and row.get('is_climax_vol', False):
+                    exit_reason = 'volume_climax'
+                
+                if not exit_reason and row.get('is_snapback', False):
+                    # is_snapback is bearish (drift < -9). Exits LONG positions.
+                    if position['direction'] == 'long':
+                        exit_reason = 'snapback_against'
+
                 # 1. Time-based exit (15 minutes)
-                if holding_period >= 15:
+                if not exit_reason and holding_period >= 15:
                     exit_reason = 'time_stop'
                 
                 # 2. Profit target (1% gain)
-                elif position['direction'] == 'long' and row['close'] >= position['entry_price'] * 1.01:
+                elif not exit_reason and position['direction'] == 'long' and row['close'] >= position['entry_price'] * 1.01:
                     exit_reason = 'profit_target'
-                elif position['direction'] == 'short' and row['close'] <= position['entry_price'] * 0.99:
+                elif not exit_reason and position['direction'] == 'short' and row['close'] <= position['entry_price'] * 0.99:
                     exit_reason = 'profit_target'
                 
                 # 3. Stop loss (0.5% loss)
-                elif position['direction'] == 'long' and row['close'] <= position['entry_price'] * 0.995:
+                elif not exit_reason and position['direction'] == 'long' and row['close'] <= position['entry_price'] * 0.995:
                     exit_reason = 'stop_loss'
-                elif position['direction'] == 'short' and row['close'] >= position['entry_price'] * 1.005:
+                elif not exit_reason and position['direction'] == 'short' and row['close'] >= position['entry_price'] * 1.005:
                     exit_reason = 'stop_loss'
                 
                 # REMOVED: Regime change exit

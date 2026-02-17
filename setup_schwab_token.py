@@ -62,7 +62,8 @@ def authenticate_and_save_token():
             api_key=API_KEY,
             app_secret=APP_SECRET,
             callback_url=CALLBACK_URL,
-            token_path=TOKEN_PATH
+            token_path=TOKEN_PATH,
+            enforce_enums=False
         )
         
         print("\n✅ Authentication successful!")

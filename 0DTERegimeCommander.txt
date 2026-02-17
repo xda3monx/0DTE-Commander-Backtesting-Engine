@@ -1,0 +1,367 @@
+# =========================================================
+# 0DTE COMMANDER GEN 3 - V19.9: DYNAMIC THETA PHYSICS
+# Core: Hunter / Manager / Guard
+# Feature: ATR-Normalized Minimum Viable Velocity (MVV), Vega Factor Integration
+# Fixed Futures Geometry issue with Volume Climax, added ADX filter and Signal Freshness
+# =========================================================
+
+declare upper;
+
+# --- TACTICAL INPUT ---
+input Trade_Context = {default "FLAT", "LONG_CALL", "LONG_PUT"};
+
+# --- VISUALS & ALERTS ---
+input show_labels = yes;
+input show_historical_bubbles = yes;
+input show_vertical_lines = yes;
+input use_alerts = yes;
+
+# --- ENGINE SETTINGS ---
+input use_rth_only = yes;
+input base_drift_min = 20;   
+input shock_min = 30;
+input vol_symbol = "/ES";
+input volume_threshold = 1.1;
+input band_dev = 2.0;
+input atr_length = 14;
+input squeeze_factor = 4.0;
+
+# --- VELOCITY SETTINGS ---
+input launch_velocity = 5;      
+input snapback_velocity = -9; 
+
+# --- IV SETTINGS ---
+input iv_threshold_morning = 0.05;
+input iv_threshold_afternoon = 0.02;
+input smooth_iv = no;
+input iv_smooth_len = 3;
+
+# --- CHRONOS TIME PHASES ---
+input time_am_end = 1100;       
+input time_pm_start = 1300;     
+input terminal_time = 1530;
+
+# --- DATA FETCHING (AUTO-DETECT & DYNAMIC BASELINE) ---
+def raw_vol = volume(vol_symbol);
+def smooth_vol_history = Average(raw_vol, 3);
+def aggPeriod = GetAggregationPeriod();
+
+# 1. Auto-Detect Futures
+# Note: GetSymbol() returns the chart symbol. If 'vol_symbol' is different (e.g. trading SPY but watching /ES volume),
+# we should check 'vol_symbol' instead.
+def isFutures = vol_symbol == "/ES" or vol_symbol == "/NQ" or vol_symbol == "/YM" or 
+                vol_symbol == "/RTY" or vol_symbol == "/MES" or vol_symbol == "/MNQ";
+
+# 2. Calculate correct bars per day
+# If Futures AND Extended Hours are enabled (use_rth_only = no), use 23 hours.
+# Otherwise (Stocks or Futures in RTH mode), use 6.5 hours.
+def hoursPerDay = if isFutures and !use_rth_only then 23 else 6.5;
+
+# 3. Milliseconds per hour = 3600 * 1000 = 3,600,000
+def barsPerDay = Max(1, Round((hoursPerDay * 3600000) / aggPeriod, 0));
+
+# 4. Check Data Sufficiency
+def hasData = BarNumber() > (barsPerDay * 5);
+
+# 5. Calculate Intelligent Baseline
+# This ensures we compare 10:00 AM today to 10:00 AM yesterday, regardless of instrument.
+def rawTimeAvg = 
+    if hasData then (GetValue(smooth_vol_history, barsPerDay) + GetValue(smooth_vol_history, barsPerDay * 2)) / 2 
+    else Average(raw_vol, 50);
+
+# --- VOLUME PHYSICS (Safe Mode) ---
+def rawTimeAvg_Safe = if rawTimeAvg > 0 then rawTimeAvg else 1; 
+def Vol_Ratio = raw_vol / rawTimeAvg_Safe;
+def Is_High_Vol = Vol_Ratio > volume_threshold;
+def Is_Climax_Vol = Vol_Ratio > 2.5; # Kept standard 2.5x because baseline is now correct
+
+# --- SESSION GUARD ---
+def inRTH = if use_rth_only then SecondsFromTime(0930) >= 0 and SecondsTillTime(1600) > 0 else yes;
+def start_of_RTH = SecondsFromTime(0930) == 0;
+
+# --- ADAPTIVE ENGINE ---
+def ADX_Raw = ADX(length = 14);
+def Is_Chop = ADX_Raw < 20; # V21: Filter weak trend signals
+def VIX_Raw = close("VIX");
+def VIX_Safe = if !IsNaN(VIX_Raw) then VIX_Raw else 20;
+
+def Is_Grind_Day = (ADX_Raw > 25 and VIX_Safe < 15) or (ADX_Raw > 30);
+def Is_Panic_Day = VIX_Safe > 25;
+
+# NOTE: Static "Theta Penalty" removed in V19.6 in favor of Dynamic MVV
+def effective_drift_min =      
+    if Is_Panic_Day then 25            
+    else if Is_Grind_Day then 12        
+    else base_drift_min;        
+
+# --- RISK ENGINE (VIX1D + CHRONOS HYBRID) ---
+def VIX1D_Raw = close("VIX1D");
+def Data_Source = if !IsNaN(VIX1D_Raw) and VIX1D_Raw > 0 then VIX1D_Raw else VIX_Safe;
+def IV_Current = if smooth_iv then ExpAverage(Data_Source, iv_smooth_len) else Data_Source;
+
+rec sumIV = if start_of_RTH then IV_Current else sumIV[1] + IV_Current;
+rec countIV = if start_of_RTH then 1 else countIV[1] + 1;
+def IV_Session_Mean = if countIV > 0 then sumIV / countIV else IV_Current;
+
+rec todayHighIV = if start_of_RTH then IV_Current else Max(IV_Current, todayHighIV[1]);
+rec todayLowIV = if start_of_RTH then IV_Current else Min(IV_Current, todayLowIV[1]);
+def IV_Range = todayHighIV - todayLowIV;
+def IV_Percentile = if IV_Range > 0 then (IV_Current - todayLowIV) / IV_Range else 0.5;
+
+rec VIX_Open_Of_Day = if start_of_RTH then VIX_Safe else VIX_Open_Of_Day[1];
+def VIX_Drop_Percent = if VIX_Open_Of_Day > 0 then (VIX_Open_Of_Day - VIX_Safe) / VIX_Open_Of_Day else 0;
+def Veto_VIX_Drop = VIX_Drop_Percent > 0.12;
+
+def Is_AM = SecondsFromTime(0930) >= 0 and SecondsTillTime(time_am_end) > 0;
+def Is_Mid = SecondsFromTime(time_am_end) >= 0 and SecondsTillTime(time_pm_start) > 0;
+def Is_PM = SecondsFromTime(time_pm_start) >= 0 and SecondsTillTime(terminal_time) > 0;
+def Is_Terminal = SecondsFromTime(terminal_time) >= 0;
+
+def is_afternoon = SecondsFromTime(1300) >= 0;
+def is_late_day = SecondsFromTime(1530) >= 0;
+def IV_Threshold = if is_afternoon then iv_threshold_afternoon else iv_threshold_morning;
+
+def Veto_Percentile = IV_Percentile < IV_Threshold and IV_Range > 1.5 and !is_late_day;
+def Veto_PM_Expansion = Is_PM and IV_Current > (IV_Session_Mean * 1.15);
+def Veto_Flash_Crash = IV_Current < (IV_Session_Mean * 0.85) and !is_late_day;
+def Warn_Terminal_Compress = Is_Terminal and (IV_Current < IV_Session_Mean);
+
+def Veto_IV_Crush_Raw = 
+    Veto_Percentile or           
+    Veto_VIX_Drop or             
+    Veto_PM_Expansion or         
+    Veto_Flash_Crash;            
+
+# --- TREND ENGINE (VWAP) ---
+rec volSum = if start_of_RTH then (if inRTH then raw_vol else 0) else if inRTH then volSum[1] + raw_vol else volSum[1];
+rec volPriceSum = if start_of_RTH then (if inRTH then raw_vol * hlc3 else 0) else if inRTH then volPriceSum[1] + raw_vol * hlc3 else volPriceSum[1];
+def VWAP = if volSum > 0 then volPriceSum / volSum else Double.NaN;
+
+# --- MOMENTUM CORE ---
+def lengthFast = 8;
+def lengthSlow = 24;
+def rawFast = if (Highest(high, lengthFast) - Lowest(low, lengthFast)) != 0 then -100 * (Highest(high, lengthFast) - close) / (Highest(high, lengthFast) - Lowest(low, lengthFast)) else 0;
+def rawSlow = if (Highest(high, lengthSlow) - Lowest(low, lengthSlow)) != 0 then -100 * (Highest(high, lengthSlow) - close) / (Highest(high, lengthSlow) - Lowest(low, lengthSlow)) else 0;
+
+def FastLine = ExpAverage(rawFast, 3);
+def SlowLine = ExpAverage(rawSlow, 2);
+def Bull_Peg = FastLine > -20 and SlowLine > -20;
+def Bear_Peg = FastLine < -80 and SlowLine < -80;
+
+def DriftSpread = AbsValue(FastLine - SlowLine);
+def Drift_SMA = Average(DriftSpread, 3);
+def DriftVelocity = DriftSpread - Drift_SMA;
+
+# --- REVERSION ENGINE ---
+rec volPriceSqSum = if start_of_RTH then (if inRTH then raw_vol * Sqr(hlc3) else 0) else if inRTH then volPriceSqSum[1] + raw_vol * Sqr(hlc3) else volPriceSqSum[1];
+def variance = if volSum > 0 then (volPriceSqSum / volSum) - Sqr(VWAP) else 0;
+def stdDev = Sqrt(if variance < 0 then 0 else variance);
+
+def UpperBand = VWAP + (band_dev * stdDev);
+def LowerBand = VWAP - (band_dev * stdDev);
+def ATR = Average(TrueRange(high, close, low), atr_length);
+def Is_Squeezing = (UpperBand - LowerBand) < (squeeze_factor * ATR);
+
+# --- THETA PHYSICS (V19.7: POLISHED VEGA GOVERNOR) ---
+# 1. Normalize Velocity by ATR
+def Normalized_Velocity = DriftVelocity / (ATR + 0.01); 
+
+# 2. Base Time Thresholds (Optimized for 5-Minute Chart)
+# Logic: Scaled for 5m candles (approx 2.5x the 1m values)
+def Base_MVV = 
+    if SecondsFromTime(1500) >= 0 then 1.25      # 3:00 PM: Requires strong push 
+    else if SecondsFromTime(1400) >= 0 then 0.75 # 2:00 PM: Requires solid trend
+    else if SecondsFromTime(1300) >= 0 then 0.40 # 1:00 PM: Requires moderate life
+    else 0.0;       
+
+# 3. Vega Governor (Asymmetric Smoothing)
+# Logic: React INSTANTLY to bad news (Headwinds), relax SLOWLY on good news.
+
+def VIX_Slope_Raw =
+    if !IsNaN(VIX_Safe[3]) and VIX_Safe[2] != 0
+    then (VIX_Safe - VIX_Safe[3]) / VIX_Safe[2]
+    else 0;
+
+def VIX_Slope_Smooth = ExpAverage(VIX_Slope_Raw, 3);
+def VIX_Slope_Clamped = Max(Min(VIX_Slope_Smooth, 0.05), -0.05);
+
+def Raw_Vega_Factor =
+    if VIX_Slope_Clamped < -0.01 then 1.5   # Headwind: VIX Crushing (Raise Hurdle)
+    else if VIX_Slope_Clamped > 0.01 then 0.8 # Tailwind: VIX Spiking (Lower Hurdle)
+    else 1.0;
+
+# Asymmetric smoothing: Fast Attack (Risk On), Slow Release (Risk Off)
+# Decay Rate: 0.9 = High Memory (Slow), 0.5 = Low Memory (Fast)
+rec Vega_Factor =
+    if IsNaN(Vega_Factor[1]) then 1.0
+    else if Raw_Vega_Factor > Vega_Factor[1] then Raw_Vega_Factor # Snap to higher hurdle instantly
+    else (Vega_Factor[1] * 0.8) + (Raw_Vega_Factor * 0.2);        # Decay toward normal (20% per bar)
+
+# 4. Final Threshold
+def MVV_Threshold = Base_MVV * Vega_Factor;
+
+# 5. Burn Condition
+def Is_Theta_Burn = 
+    SecondsFromTime(1300) >= 0 and
+    DriftSpread > effective_drift_min and
+    Normalized_Velocity < MVV_Threshold;
+
+# --- PHYSICS ENGINE ---
+def Is_Launch   = DriftSpread[1] < effective_drift_min and DriftVelocity > launch_velocity;
+def Is_Snapback = DriftSpread[1] > shock_min and DriftVelocity < snapback_velocity;
+
+def Snapback_Bullish = Is_Snapback and SlowLine < -50; 
+def Snapback_Bearish = Is_Snapback and SlowLine > -50; 
+
+def Is_Explosive_Push = DriftVelocity > 10 and Is_High_Vol;
+def Veto_IV_Crush = Veto_IV_Crush_Raw and !Is_Explosive_Push;
+
+# --- SNIPER LOGIC ---
+def Touched_Lower = low <= LowerBand;
+def Reclaimed_Lower = close > LowerBand;
+def Sniper_Buy = Touched_Lower and Reclaimed_Lower and Is_High_Vol and AbsValue(DriftVelocity) < 8;
+
+def Touched_Upper = high >= UpperBand;
+def Reclaimed_Upper = close < UpperBand;
+def Sniper_Sell = Touched_Upper and Reclaimed_Upper and Is_High_Vol and AbsValue(DriftVelocity) < 8;
+
+# --- REGIME STATE MACHINE ---
+def Regime_State = 
+    if Veto_IV_Crush then 0
+    else if Snapback_Bullish then 9     
+    else if Snapback_Bearish then 11    
+    else if Sniper_Buy then 13         
+    else if Sniper_Sell then 14       
+    else if Is_Squeezing then 1
+   # V19.9: Added !Is_Chop check to Trend Signals
+    else if Is_Launch and !Is_Chop then 10           
+    else if (high >= UpperBand or low <= LowerBand) and !Is_High_Vol and DriftSpread < effective_drift_min then 2
+    else if Bull_Peg and !Is_Chop then 3
+    else if Bear_Peg and !Is_Chop then 4
+    else if SlowLine > -40 and (DriftSpread > effective_drift_min) and (FastLine < SlowLine) then 7
+    else if SlowLine < -60 and (DriftSpread > effective_drift_min) and (FastLine > SlowLine) then 8
+    else 5;
+
+# --- CONTEXT AWARENESS ---
+# --- SIGNAL FRESHNESS (V21) ---
+# Count how many bars we have been in the current state
+rec State_Counter = if Regime_State != Regime_State[1] then 1 else State_Counter[1] + 1;
+# Warning if signal is older than 4 bars (20 mins on 5m chart)
+def Is_Stale = State_Counter > 4;
+
+def Market_Bias = 
+    if Regime_State == 3 or Regime_State == 7 or Regime_State == 9 or Regime_State == 10 or Regime_State == 13 then 1 
+    else if Regime_State == 4 or Regime_State == 8 or Regime_State == 11 or Regime_State == 14 then -1 
+    else 0;
+
+def Context_Status =
+    if Trade_Context == Trade_Context."FLAT" then 0
+    else if (Trade_Context == Trade_Context."LONG_CALL" and Market_Bias == 1) then 1
+    else if (Trade_Context == Trade_Context."LONG_PUT" and Market_Bias == -1) then 1
+    else if (Trade_Context == Trade_Context."LONG_CALL" and Market_Bias == -1) then -1
+    else if (Trade_Context == Trade_Context."LONG_PUT" and Market_Bias == 1) then -1
+    else 0;
+
+# --- VERBALIZATION ENGINE ---
+
+AddLabel(show_labels, 
+    if Regime_State == 0 then 
+        if Veto_PM_Expansion then " ⛔ HALT: PM GAMMA RISK "
+        else if Veto_Percentile then " ⛔ HALT: IV CRUSH "
+        else if Veto_Flash_Crash then " ⛔ HALT: IV FLASH CRASH "
+        else " ⛔ HALT: VIX DROP "
+    else if Regime_State == 1 then " ⚠️ SQUEEZE: COILING "
+    else if Regime_State == 10 then " 🚀 LAUNCH: IGNITION "
+    else if Is_Theta_Burn then " ⚠️ THETA BURN: VELOCITY < MVV "
+    else if Warn_Terminal_Compress then " ✅ COMMANDER (THETA RISK) "
+    else " ✅ COMMANDER ACTIVE ", 
+    if Regime_State == 0 then Color.RED 
+    else if Regime_State == 1 then Color.YELLOW 
+    else if Regime_State == 10 then Color.GREEN 
+    else if Is_Theta_Burn or Warn_Terminal_Compress then Color.ORANGE
+    else Color.GRAY
+);
+
+AddLabel(show_labels and Regime_State != 0,
+    if Context_Status == -1 and Trade_Context != Trade_Context."FLAT" then
+        if Is_Snapback then " ☠️ GUARD: SNAPBACK AGAINST YOU - ABORT IMMEDIATE "
+        else " 🚨 GUARD: WRONG SIDE - EXIT "
+    
+    else if Context_Status == 1 then
+        if Is_Snapback then " 💰 MANAGER: SNAPBACK - TAKE PROFIT NOW "
+        else if Is_Climax_Vol then " 💰 MANAGER: VOL CLIMAX - TAKE PROFIT "
+        else if Is_Theta_Burn then " ⚠️ MANAGER: THETA BURN - TIGHTEN/EXIT "
+        else if DriftVelocity < -5 then " ⚠️ MANAGER: VELOCITY FADING - TIGHTEN STOP "
+        else if Is_Launch then " 🚀 MANAGER: LAUNCH DETECTED - ADD SIZE "
+        else if Is_Stale then " ⚠️ MANAGER: TREND AGING - TRAIL STOP "
+        else " 🛡️ MANAGER: TREND HEALTHY - HOLD "
+
+       # --- HUNTER MODE (You are looking) ---
+    else if Trade_Context == Trade_Context."FLAT" then
+        if Regime_State == 13 then " 🎯 SNIPER: BULL RECLAIM (CALLS) "
+        else if Regime_State == 14 then " 🎯 SNIPER: BEAR RECLAIM (PUTS) "
+        else if Regime_State == 9 then " ⚠️ HUNTER: SNAPBACK BUY (AGGRESSIVE) "
+        else if Regime_State == 11 then " ⚠️ HUNTER: SNAPBACK SELL (AGGRESSIVE) "
+        
+        # Trend Signals: Check Freshness
+        else if Regime_State == 10 then 
+            (if Is_Stale then " ⏳ HUNTER: LAUNCH STALE - WAIT " else " 🚀 HUNTER: LAUNCH DETECTED - GO ")
+        
+        else if Regime_State == 3 then 
+            (if Is_Stale then " ⏳ HUNTER: BULL TREND AGING - CAUTION "
+             else if Is_High_Vol then " ✅ HUNTER: BULL POWER - BUY PULLBACKS " 
+             else " ⚠️ HUNTER: RETAIL BULL DRIFT - CAUTION ")
+             
+        else if Regime_State == 4 then 
+            (if Is_Stale then " ⏳ HUNTER: BEAR TREND AGING - CAUTION "
+             else if Is_High_Vol then " ✅ HUNTER: BEAR POWER - BUY RIPS " 
+             else " ⚠️ HUNTER: RETAIL BEAR DRIFT - CAUTION ")
+             
+        else if Regime_State == 7 then " ✅ HUNTER: DIP ENTRY (CALLS) "
+        else if Regime_State == 8 then " ✅ HUNTER: RIP ENTRY (PUTS) "
+        else " 💤 HUNTER: WAIT FOR SETUP "
+    else " --- ",
+
+    if Context_Status == -1 then Color.RED 
+    else if Context_Status == 1 then (if Is_Snapback or Is_Climax_Vol or Is_Theta_Burn then Color.YELLOW else Color.GREEN)
+    else Color.CYAN
+);
+
+# VIX1D Diagnostic (shows data source and compression state)
+AddLabel(show_labels,
+    (if !IsNaN(VIX1D_Raw) and VIX1D_Raw > 0 then "VIX1D: " else "VIX: ") + 
+    Round(IV_Current, 1) + " " +
+    (if IV_Current < IV_Session_Mean then "↓" else if IV_Current > IV_Session_Mean then "↑" else "→") +
+    Round(AbsValue((IV_Current - IV_Session_Mean) / IV_Session_Mean * 100), 1) + "%",
+    if Veto_Flash_Crash then Color.RED
+    else if IV_Current < IV_Session_Mean then Color.CYAN
+    else if IV_Current > IV_Session_Mean * 1.10 then Color.ORANGE
+    else Color.GRAY
+);
+
+# Chronos Phase Label (time-of-day context)
+AddLabel(show_labels,
+    if Is_AM then " ⏰ DISCOVERY "
+    else if Is_Mid then " ⏰ MIDDAY "
+    else if Is_PM then " ⏰ PM SESSION "
+    else " ⏰ TERMINAL ",
+    if Is_Terminal then Color.ORANGE
+    else if Is_Mid and IV_Current < IV_Session_Mean then Color.GREEN
+    else Color.GRAY
+);
+
+# --- VEGA GOVERNOR VISIBILITY ---
+AddLabel(show_labels and Vega_Factor > 1.05, 
+    " 🌬️ VEGA HEADWIND: HURDLE +" + Round((Vega_Factor - 1) * 100, 0) + "% ", 
+    Color.MAGENTA
+);
+
+AddLabel(show_labels and Vega_Factor < 0.95, 
+    " 🌪️ VEGA TAILWIND: HURDLE -" + Round((1 - Vega_Factor) * 100, 0) + "% ", 
+    Color.CYAN
+);
+
+# Alerts
+Alert(use_alerts and Regime_State[1] != 10 and Regime_State == 10, "COMMANDER: LAUNCH DETECTED", Alert.BAR, Sound.Ding);
+Alert(use_alerts and Regime_State[1] != 9 and Regime_State == 9, "COMMANDER: BULL SNAPBACK", Alert.BAR, Sound.Ring);
+Alert(use_alerts and Regime_State[1] != 11 and Regime_State == 11, "COMMANDER: BEAR SNAPBACK", Alert.BAR, Sound.Ring);

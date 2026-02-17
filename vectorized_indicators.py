@@ -145,6 +145,10 @@ class VectorizedIndicators:
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         self.df['atr'] = tr.rolling(14).mean()
 
+        # Alias ATR as volatility for BacktestingEngine compatibility
+        self.df['volatility'] = self.df['atr']
+        self.df['volatility_pct'] = (self.df['volatility'] / self.df['close']) * 100
+
         # ADX calculation (simplified implementation)
         # Directional Movement
         dm_plus = np.where(
@@ -171,7 +175,7 @@ class VectorizedIndicators:
         self.df['adx'] = dx.rolling(14).mean()
 
         # IsChop (ADX-based choppiness filter)
-        self.df['is_chop'] = self.df['adx'] < 20
+        self.df['is_chop'] = self.df['adx'] < 15
 
         # Normalize velocity by ATR
         self.df['normalized_velocity'] = self.df['drift_velocity'] / (self.df['atr'] + 0.01)
@@ -246,8 +250,8 @@ class VectorizedIndicators:
         # Higher in volatile conditions, lower in calm conditions
         vix_proxy = self.df['vix_proxy'] if 'vix_proxy' in self.df.columns else self.df['atr']
         self.df['effective_drift_min'] = np.where(
-            vix_proxy > vix_proxy.quantile(0.8), 35,  # High volatility: higher threshold
-            np.where(vix_proxy < vix_proxy.quantile(0.2), 15, 25)  # Low volatility: lower threshold
+            vix_proxy > vix_proxy.quantile(0.8), 25,  # High volatility: lowered from 35
+            np.where(vix_proxy < vix_proxy.quantile(0.2), 10, 15)  # Low volatility: lowered from 15/25
         )
 
         # Shock events (using effective drift min)
@@ -294,6 +298,24 @@ class VectorizedIndicators:
         choices = [9, 10, 3, 4, 2]
 
         self.df['regime_state'] = np.select(conditions, choices, default=5)  # 5: Trend
+
+        # Map regime_state integer to string description for BacktestingEngine compatibility
+        regime_map = {
+            9: 'snapback',
+            10: 'launch',
+            3: 'bull_peg',
+            4: 'bear_peg',
+            2: 'noise',
+            5: 'trend'
+        }
+        
+        # Create 'regime' column using map
+        self.df['regime'] = self.df['regime_state'].map(regime_map)
+        self.df['regime'] = self.df['regime'].fillna('unknown')
+
+        # Log regime distribution to help debug missing signals
+        regime_counts = self.df['regime_state'].value_counts().to_dict()
+        logger.info(f"Regime state distribution: {regime_counts}")
 
         logger.info("Regime states calculated")
         return self.df
@@ -454,11 +476,11 @@ class VectorizedIndicators:
         - TICK Extreme: Too many/few stocks advancing (extreme breadth)
         - Mag7 Concentration: Excessive tech mega-cap concentration
         """
-        # Check for internals data availability
-        has_uvol = 'uvol_close' in self.df.columns
-        has_dvol = 'dvol_close' in self.df.columns
-        has_trin = 'trin_close' in self.df.columns
-        has_tick = 'tick_close' in self.df.columns
+        # Check for internals data availability (multiple column name variants)
+        has_uvol = 'uvol_close' in self.df.columns or '$uvol_close' in self.df.columns
+        has_dvol = 'dvol_close' in self.df.columns or '$dvol_close' in self.df.columns
+        has_trin = 'trin_close' in self.df.columns or '$trin_close' in self.df.columns
+        has_tick = 'tick_close' in self.df.columns or '$tick_close' in self.df.columns
         has_mag7 = 'mag7_close' in self.df.columns
         
         if not has_uvol or not has_dvol:
@@ -466,10 +488,17 @@ class VectorizedIndicators:
             self.df['veto_internals'] = False
             return
         
+        # Normalize column names
+        uvol_col = '$uvol_close' if '$uvol_close' in self.df.columns else 'uvol_close'
+        dvol_col = '$dvol_close' if '$dvol_close' in self.df.columns else 'dvol_close'
+        trin_col = '$trin_close' if '$trin_close' in self.df.columns else 'trin_close'
+        tick_col = '$tick_close' if '$tick_close' in self.df.columns else 'tick_close'
+        mag7_col = 'mag7_close'
+        
         # UVOL/DVOL ratio analysis
         # Ratio > 3 = strong bull, ratio < 0.33 = strong bear
         # Extreme ratios (>4 or <0.25) suggest market fatigue / hidden weakness
-        self.df['uvol_dvol_ratio'] = self.df['uvol_close'] / (self.df['dvol_close'] + 1)  # Avoid div by 0
+        self.df['uvol_dvol_ratio'] = self.df[uvol_col] / (self.df[dvol_col] + 1)  # Avoid div by 0
         
         uvol_dvol_extreme = (
             (self.df['uvol_dvol_ratio'] > 4.0) |  # Excessive bull bias
@@ -484,8 +513,8 @@ class VectorizedIndicators:
         # < 0.5: Extreme rally (unsustainable)
         if has_trin:
             trin_extreme = (
-                (self.df['trin_close'] > 2.5) |  # Breadth very weak
-                (self.df['trin_close'] < 0.4)    # Rally too strong (bubble risk)
+                (self.df[trin_col] > 2.5) |  # Breadth very weak
+                (self.df[trin_col] < 0.4)    # Rally too strong (bubble risk)
             )
             self.df['veto_trin_extreme'] = trin_extreme
         else:
@@ -494,11 +523,11 @@ class VectorizedIndicators:
         # TICK analysis (NYSE Advance/Decline)
         # Based on session extremes (percentile relative to session)
         if has_tick:
-            session_tick_high = self.df.groupby(self.df.index.date)['tick_close'].transform('max')
-            session_tick_low = self.df.groupby(self.df.index.date)['tick_close'].transform('min')
+            session_tick_high = self.df.groupby(self.df.index.date)[tick_col].transform('max')
+            session_tick_low = self.df.groupby(self.df.index.date)[tick_col].transform('min')
             
-            tick_extreme_low = self.df['tick_close'] < session_tick_low * 0.8  # Bottom 20%
-            tick_extreme_high = self.df['tick_close'] > session_tick_high * 0.8  # Top 20%
+            tick_extreme_low = self.df[tick_col] < session_tick_low * 0.8  # Bottom 20%
+            tick_extreme_high = self.df[tick_col] > session_tick_high * 0.8  # Top 20%
             
             self.df['veto_tick_extreme'] = tick_extreme_low | tick_extreme_high
         else:
@@ -508,7 +537,7 @@ class VectorizedIndicators:
         # High concentration (Mag7 outperforming by >2% vs market average) = risk
         if has_mag7:
             # Simplified: If Mag7 volatility exceeds 2x market volatility = concentration risk
-            mag7_vol = self.df['mag7_close'].pct_change().rolling(20).std()
+            mag7_vol = self.df[mag7_col].pct_change().rolling(20).std()
             market_vol = self.df['close'].pct_change().rolling(20).std()
             
             mag7_concentrated = (mag7_vol > market_vol * 2.0)

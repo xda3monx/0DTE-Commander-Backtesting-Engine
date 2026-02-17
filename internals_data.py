@@ -116,7 +116,8 @@ class InternalsDataHandler:
                 api_key=API_KEY,
                 app_secret=APP_SECRET,
                 callback_url=CALLBACK_URL,
-                token_path=TOKEN_PATH
+                token_path=TOKEN_PATH,
+                enforce_enums=False
             )
             logger.info("Schwab token refreshed successfully")
             return True
@@ -144,7 +145,8 @@ class InternalsDataHandler:
                 api_key=API_KEY,
                 app_secret=APP_SECRET,
                 callback_url=CALLBACK_URL,
-                token_path=TOKEN_PATH
+                token_path=TOKEN_PATH,
+                enforce_enums=False
             )
             logger.info("Schwab API authenticated successfully")
             return True
@@ -156,7 +158,8 @@ class InternalsDataHandler:
     def fetch_internals_data(self, 
                             symbol: str,
                             period_days: int = 5,
-                            interval: str = '5m') -> Optional[pd.DataFrame]:
+                            interval: str = '5m',
+                            retry: bool = True) -> Optional[pd.DataFrame]:
         """
         Fetch Internals data from Schwab API.
         
@@ -178,32 +181,43 @@ class InternalsDataHandler:
             start_date = end_date - timedelta(days=period_days)
             
             # Map interval to Schwab API format
-            freq_map = {
-                '5m': 'every_5_minutes',
-                '15m': 'every_15_minutes',
-                '1h': 'every_hour',
-                '1d': 'daily'
-            }
+            if interval == '1d':
+                frequency_type = 'daily'
+                frequency = 1
+            elif interval == '1h':
+                frequency_type = 'minute'
+                frequency = 60
+            elif interval == '15m':
+                frequency_type = 'minute'
+                frequency = 15
+            else:
+                # Default to 5m
+                frequency_type = 'minute'
+                frequency = 5
             
-            freq = freq_map.get(interval, 'every_5_minutes')
-            
-            # Fetch using pricehistory
-            response = self.schwab_client.pricehistory(
+            # Fetch using get_price_history
+            response = self.schwab_client.get_price_history(
                 symbol=symbol,
                 period_type='day',
                 period=period_days,
-                frequency_type=freq.split('_')[1],  # Extract type (minute, hour, day)
-                frequency=int(freq.split('_')[0]) if 'minute' in freq else 1,
-                extended_hours=True
+                frequency_type=frequency_type,
+                frequency=frequency,
+                need_extended_hours_data=True
             )
             
-            if response['candles'] is None or len(response['candles']) == 0:
+            if response.status_code != 200:
+                logger.error(f"API Error {response.status_code}: {response.text}")
+                return None
+
+            r_json = response.json()
+            
+            if r_json.get('candles') is None or len(r_json['candles']) == 0:
                 logger.warning(f"No data returned for {symbol}")
                 return None
             
             # Convert to DataFrame
             data = []
-            for candle in response['candles']:
+            for candle in r_json['candles']:
                 data.append({
                     'timestamp': candle['datetime'] // 1000,  # Convert ms to seconds
                     'datetime_utc': datetime.fromtimestamp(candle['datetime'] // 1000).isoformat(),
@@ -221,9 +235,9 @@ class InternalsDataHandler:
         except Exception as e:
             logger.error(f"Failed to fetch {symbol}: {e}")
             logger.info("Token may have expired. Attempting refresh...")
-            if self.refresh_schwab_token():
+            if retry and self.refresh_schwab_token():
                 logger.info("Retrying fetch after token refresh...")
-                return self.fetch_internals_data(symbol, period_days, interval)
+                return self.fetch_internals_data(symbol, period_days, interval, retry=False)
             return None
     
     def fetch_all_internals(self, period_days: int = 5) -> Dict[str, pd.DataFrame]:
@@ -237,11 +251,13 @@ class InternalsDataHandler:
             Dictionary mapping symbol to DataFrame
         """
         internals_config = {
-            '$UVOL': 'Up Volume - Total share volume of stocks trading on upticks',
-            '$DVOL': 'Down Volume - Total share volume of stocks trading on downticks',
-            '$TRIN': 'ARMS Index - Market breadth indicator (1.0 = balanced)',
-            '$TICK': 'NYSE Advance/Decline Line',
-            '^MAG7': 'Magnificent 7 Index - Mega-cap tech concentration'
+            '$UVOLSP': 'SPX Up Volume - Total share volume of stocks trading on upticks',
+            '$DVOLSP': 'SPX Down Volume - Total share volume of stocks trading on downticks',
+            '$TRINSP': 'SPX ARMS Index - Market breadth indicator (1.0 = balanced)',
+            '$TIKSP': 'SPX Tick - NYSE Advance/Decline Line',
+            '$ADVSP': 'SPX Advances - Number of stocks advancing',
+            '$DECLSP': 'SPX Declines - Number of stocks declining',
+            '$ADSPD': 'SPX Advance/Decline - Market breadth'
         }
         
         all_data = {}
@@ -312,20 +328,31 @@ class InternalsDataHandler:
             
             # Pivot data by symbol
             all_dfs = {}
-            symbols = ['$UVOL', '$DVOL', '$TRIN', '$TICK', '^MAG7']
+            # Map the symbols fetched from Schwab to the simplified names used elsewhere
+            symbol_map = {
+                '$UVOLSP': 'uvol',
+                '$DVOLSP': 'dvol',
+                '$TRINSP': 'trin',
+                '$TIKSP': 'tick',
+                '$ADVSP': 'adv',
+                '$DECLSP': 'decl',
+                '$ADSPD': 'ad'
+            }
             
-            for symbol in symbols:
-                query = '''
+            placeholders = ','.join('?' * len(timestamps))
+            for real_symbol, clean_name in symbol_map.items():
+                query = f'''
                 SELECT timestamp, datetime_utc, close FROM internals_data
-                WHERE symbol = ? AND timeframe = ?
+                WHERE symbol = ? AND timeframe = ? AND timestamp IN ({placeholders})
                 ORDER BY timestamp
                 '''
-                df = pd.read_sql_query(query, self.conn, params=(symbol, timeframe))
+                df = pd.read_sql_query(query, self.conn, params=[real_symbol, timeframe] + timestamps)
                 
                 if not df.empty:
-                    df = df.rename(columns={'close': f'{symbol.lower()}_close'})
+                    # Create column names like 'uvol_close', 'dvol_close'
+                    df = df.rename(columns={'close': f'{clean_name}_close'})
                     df = df.drop('datetime_utc', axis=1)
-                    all_dfs[symbol] = df
+                    all_dfs[real_symbol] = df
             
             # Merge all symbols by timestamp
             if not all_dfs:
@@ -337,7 +364,7 @@ class InternalsDataHandler:
                 merged = merged.merge(df, on='timestamp', how='left')
             
             # Forward fill any gaps
-            merged = merged.fillna(method='ffill')
+            merged = merged.ffill()
             
             merged['datetime_utc'] = pd.to_datetime(merged['timestamp'], unit='s', utc=True)
             merged = merged.sort_values('timestamp')

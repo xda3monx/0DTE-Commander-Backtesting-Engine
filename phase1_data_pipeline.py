@@ -78,7 +78,8 @@ class DataPipeline:
                 api_key=API_KEY,
                 app_secret=APP_SECRET,
                 callback_url=CALLBACK_URL,
-                token_path=TOKEN_PATH
+                token_path=TOKEN_PATH,
+                enforce_enums=False
             )
             logger.info("Schwab API authenticated successfully")
             return True
@@ -174,46 +175,36 @@ class DataPipeline:
         logger.info(f"Fetching {period} {interval} data for {symbol} from Schwab API")
         
         try:
-            # Convert period to start/end dates
-            end_date = datetime.now()
-            if period == '1mo':
-                start_date = end_date - timedelta(days=30)
-            elif period == '2mo':
-                start_date = end_date - timedelta(days=60)
-            elif period == '3mo':
-                start_date = end_date - timedelta(days=90)
-            elif period == '6mo':
-                start_date = end_date - timedelta(days=180)
-            elif period == '9mo':
-                start_date = end_date - timedelta(days=270)
-            elif period == '1y':
-                start_date = end_date - timedelta(days=365)
-            else:
-                start_date = end_date - timedelta(days=180)  # Default 6 months
-            
             # Convert interval to Schwab format
             if interval == '5m':
                 frequency_type = 'minute'
                 frequency = 5
+                # Minute data requires period_type='day'
+                req_period_type = 'day'
+                req_period = 10
             elif interval == '1h':
                 frequency_type = 'minute'
                 frequency = 60
+                req_period_type = 'day'
+                req_period = 10
             elif interval == '1d':
                 frequency_type = 'daily'
                 frequency = 1
+                req_period_type = 'month'
+                req_period = 6
             else:
                 frequency_type = 'minute'
                 frequency = 5
+                req_period_type = 'day'
+                req_period = 5
             
             # Fetch historical data
             response = self.schwab_client.get_price_history(
                 symbol=symbol,
-                period_type='month',  # Use month for longer periods
-                period=6,  # 6 months
+                period_type=req_period_type,
+                period=req_period,
                 frequency_type=frequency_type,
                 frequency=frequency,
-                start_datetime=start_date,
-                end_datetime=end_date,
                 need_extended_hours_data=False
             )
             
@@ -374,8 +365,8 @@ class DataPipeline:
             
             timestamps = sorted([t[0] for t in timestamps])
             
-            # Load each symbol
-            symbols = ['$uvol', '$dvol', '$trin', '$tick', '^mag7']
+            # Load each symbol (use uppercase as stored in DB)
+            symbols = ['$UVOL', '$DVOL', '$TRIN', '$TICK', '^MAG7']
             dfs = {}
             
             for symbol in symbols:
@@ -554,14 +545,18 @@ class DataPipeline:
         # Load Mag7 data
         mag7_data = {}
         for mag_symbol in self.mag7_symbols.keys():
-            df = self.load_symbol_data(mag_symbol)
-            if df.empty:
-                # For stocks, try 2 months of 5m data
-                df = self.fetch_yfinance_data(mag_symbol, period='2mo', interval='5m')
+            try:
+                df = self.load_symbol_data(mag_symbol)
+                if df.empty:
+                    # For stocks, try 2 months of 5m data
+                    df = self.fetch_schwab_historical_data(mag_symbol, period='2mo', interval='5m')
+                    if not df.empty:
+                        self.store_data(df)
                 if not df.empty:
-                    self.store_data(df)
-            if not df.empty:
-                mag7_data[mag_symbol] = df
+                    mag7_data[mag_symbol] = df
+            except Exception as e:
+                logger.warning(f"Skipping {mag_symbol} due to fetch error (likely date mismatch): {e}")
+                continue
         
         # Add Mag7 to dataframes for merging
         dataframes.update(mag7_data)
